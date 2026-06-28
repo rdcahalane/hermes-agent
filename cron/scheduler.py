@@ -1252,6 +1252,38 @@ class _BoundedCronSessionDB:
 
         return _bounded
 
+def _sanitize_cron_final_response(job: dict, final_response: str) -> str:
+    """Apply small deterministic cleanup for known cron formats.
+
+    This keeps saved/delivered cron output clean even when the model adds
+    setup chatter that violates the skill instructions.
+    """
+    text = str(final_response or "")
+    if not text.strip():
+        return ""
+
+    job_name = str(job.get("name") or "").strip().lower()
+    skill_name = str(job.get("skill") or "").strip().lower()
+    skills = [str(s).strip().lower() for s in (job.get("skills") or [])]
+
+    is_morning_brief = (
+        job_name == "morning-brief"
+        or skill_name == "morning-brief"
+        or "morning-brief" in skills
+    )
+    if not is_morning_brief:
+        return text
+
+    marker = "MORNING BRIEF —"
+    idx = text.find(marker)
+    if idx != -1:
+        text = text[idx:]
+
+    # If the model appends a SILENT marker after real content, drop it.
+    lines = [line for line in text.splitlines() if line.strip() != "[SILENT]"]
+    text = "\n".join(lines).strip()
+    return text
+
 
 def _job_doc_header(job_name: str, job_id: str, now_iso: str, mode: str) -> str:
     """Common markdown header for the short-circuit run docs (no_agent / monitor)."""
@@ -1873,6 +1905,39 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
     return final_response
 
 
+def _sanitize_cron_final_response(job: dict, final_response: str) -> str:
+    """Apply small deterministic cleanup for known cron formats.
+
+    This keeps saved/delivered cron output clean even when the model adds
+    setup chatter that violates the skill instructions.
+    """
+    text = str(final_response or "")
+    if not text.strip():
+        return ""
+
+    job_name = str(job.get("name") or "").strip().lower()
+    skill_name = str(job.get("skill") or "").strip().lower()
+    skills = [str(s).strip().lower() for s in (job.get("skills") or [])]
+
+    is_morning_brief = (
+        job_name == "morning-brief"
+        or skill_name == "morning-brief"
+        or "morning-brief" in skills
+    )
+    if not is_morning_brief:
+        return text
+
+    marker = "MORNING BRIEF —"
+    idx = text.find(marker)
+    if idx != -1:
+        text = text[idx:]
+
+    # If the model appends a SILENT marker after real content, drop it.
+    lines = [line for line in text.splitlines() if line.strip() != "[SILENT]"]
+    text = "\n".join(lines).strip()
+    return text
+
+
 def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_session_id: str) -> None:
     """Title, classify, end and release the cron session after the agent turn has returned."""
     # Bound every DB op so storage failure cannot hold the dispatch guard.
@@ -2334,6 +2399,7 @@ def run_job(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
+        final_response = _sanitize_cron_final_response(job, final_response)
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
         output = _run_doc_header(job, job_name, job_id, prompt) + f"## Response\n\n{logged_response}\n"
