@@ -2713,6 +2713,39 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _sanitize_cron_final_response(job: dict, final_response: str) -> str:
+    """Apply small deterministic cleanup for known cron formats.
+
+    This keeps saved/delivered cron output clean even when the model adds
+    setup chatter that violates the skill instructions.
+    """
+    text = str(final_response or "")
+    if not text.strip():
+        return ""
+
+    job_name = str(job.get("name") or "").strip().lower()
+    skill_name = str(job.get("skill") or "").strip().lower()
+    skills = [str(s).strip().lower() for s in (job.get("skills") or [])]
+
+    is_morning_brief = (
+        job_name == "morning-brief"
+        or skill_name == "morning-brief"
+        or "morning-brief" in skills
+    )
+    if not is_morning_brief:
+        return text
+
+    marker = "MORNING BRIEF —"
+    idx = text.find(marker)
+    if idx != -1:
+        text = text[idx:]
+
+    # If the model appends a SILENT marker after real content, drop it.
+    lines = [line for line in text.splitlines() if line.strip() != "[SILENT]"]
+    text = "\n".join(lines).strip()
+    return text
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -3621,6 +3654,7 @@ def run_job(
                     turn_exit_reason,
                 )
                 final_response = ""
+        final_response = _sanitize_cron_final_response(job, final_response)
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
