@@ -1486,6 +1486,38 @@ class _BoundedCronSessionDB:
 
         return _bounded
 
+def _sanitize_cron_final_response(job: dict, final_response: str) -> str:
+    """Apply small deterministic cleanup for known cron formats.
+
+    This keeps saved/delivered cron output clean even when the model adds
+    setup chatter that violates the skill instructions.
+    """
+    text = str(final_response or "")
+    if not text.strip():
+        return ""
+
+    job_name = str(job.get("name") or "").strip().lower()
+    skill_name = str(job.get("skill") or "").strip().lower()
+    skills = [str(s).strip().lower() for s in (job.get("skills") or [])]
+
+    is_morning_brief = (
+        job_name == "morning-brief"
+        or skill_name == "morning-brief"
+        or "morning-brief" in skills
+    )
+    if not is_morning_brief:
+        return text
+
+    marker = "MORNING BRIEF —"
+    idx = text.find(marker)
+    if idx != -1:
+        text = text[idx:]
+
+    # If the model appends a SILENT marker after real content, drop it.
+    lines = [line for line in text.splitlines() if line.strip() != "[SILENT]"]
+    text = "\n".join(lines).strip()
+    return text
+
 
 def _resolve_job_workdir(job: dict, job_id: str) -> Optional[str]:
     """Configured job workdir, or None when unset / no longer a directory (logged)."""
@@ -2114,6 +2146,39 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
     return final_response
 
 
+def _sanitize_cron_final_response(job: dict, final_response: str) -> str:
+    """Apply small deterministic cleanup for known cron formats.
+
+    This keeps saved/delivered cron output clean even when the model adds
+    setup chatter that violates the skill instructions.
+    """
+    text = str(final_response or "")
+    if not text.strip():
+        return ""
+
+    job_name = str(job.get("name") or "").strip().lower()
+    skill_name = str(job.get("skill") or "").strip().lower()
+    skills = [str(s).strip().lower() for s in (job.get("skills") or [])]
+
+    is_morning_brief = (
+        job_name == "morning-brief"
+        or skill_name == "morning-brief"
+        or "morning-brief" in skills
+    )
+    if not is_morning_brief:
+        return text
+
+    marker = "MORNING BRIEF —"
+    idx = text.find(marker)
+    if idx != -1:
+        text = text[idx:]
+
+    # If the model appends a SILENT marker after real content, drop it.
+    lines = [line for line in text.splitlines() if line.strip() != "[SILENT]"]
+    text = "\n".join(lines).strip()
+    return text
+
+
 def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_session_id: str,
                            workdir: Optional[str] = None) -> None:
     """Title, classify, end and release the cron session after the agent turn has returned."""
@@ -2610,6 +2675,7 @@ def run_job(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
+        final_response = _sanitize_cron_final_response(job, final_response)
         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
                 and _cron_failure_marker_error(final_response) is None):
             # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
