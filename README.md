@@ -184,6 +184,12 @@ All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes
 
 ---
 
+## Local Operator Docs
+
+- [Discord Agent Journey](docs/discord-agent-journey.md) — Ryan-focused discovery, setup, trial, approval, agent entrypoint, and verification flow for Hermes on Discord.
+
+---
+
 ## Migrating from OpenClaw
 
 If you're coming from OpenClaw, Hermes can automatically import your settings, memories, skills, and API keys.
