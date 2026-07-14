@@ -148,11 +148,25 @@ jobs:
       - name: Merge into single durations file
         run: |
           python3 -c "
-          import json, glob, os
+          import json, glob
           merged = {}
-          for f in glob.glob('durations/*test_durations.json'):
-            with open(f) as fh:
-              merged.update(json.load(fh))
+          dec = json.JSONDecoder()
+          for f in sorted(glob.glob('durations/*test_durations.json')):
+            try:
+              text = open(f).read()
+              # Tolerate a file with concatenated JSON objects (a slice can write its
+              # durations more than once) — decode every object, not just the first.
+              idx, n = 0, len(text)
+              while idx < n:
+                while idx < n and text[idx].isspace():
+                  idx += 1
+                if idx >= n:
+                  break
+                obj, idx = dec.raw_decode(text, idx)
+                if isinstance(obj, dict):
+                  merged.update(obj)
+            except Exception as e:
+              print(f'::warning::skipping malformed durations file {f}: {e}')
           with open('test_durations.json', 'w') as fh:
             json.dump(merged, fh, indent=2, sort_keys=True)
           print(f'Merged {len(merged)} file durations')
