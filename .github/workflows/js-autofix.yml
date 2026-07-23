@@ -197,7 +197,15 @@ jobs:
           fi
 
           # Enable auto-merge (squash). If already enabled, this is a no-op.
-          gh pr merge "$PR_NUM" --auto --squash || true
+          # When auto-merge can't be enabled — no required status checks on
+          # main (GitHub rejects --auto on a "clean status" PR), or the PR
+          # was created with GITHUB_TOKEN (App creds unset), which never
+          # triggers CI so no checks will ever report — fall back to a
+          # direct squash merge. Without the fallback the PR sits open
+          # forever and the wait step below times out.
+          gh pr merge "$PR_NUM" --auto --squash \
+            || gh pr merge "$PR_NUM" --squash \
+            || true
 
       - name: Wait for merge, auto-close on failure or stale
         env:
