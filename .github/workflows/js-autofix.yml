@@ -149,6 +149,7 @@ jobs:
       - name: Apply patch and push to bot branch
         env:
           BOT_BRANCH: bot/js-autofix
+          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
 
@@ -174,7 +175,14 @@ jobs:
           # bot/js-autofix is a bot-only branch that gets rewritten each run.
           # If the branch was deleted after a previous PR merge, this
           # recreates it.
-          git push --force origin HEAD:"$BOT_BRANCH"
+          #
+          # Push with the App token, not checkout's GITHUB_TOKEN: only App
+          # pushes trigger pull_request workflows, so this is what gets CI
+          # running on the bot PR (see the NOTE at the top of this file —
+          # the concurrency group prevents the trigger loop).
+          git push --force \
+            "https://x-access-token:${GH_APP_TOKEN}@github.com/${{ github.repository }}.git" \
+            HEAD:"$BOT_BRANCH"
 
       - name: Create/update PR and enable auto-merge
         env:
@@ -197,15 +205,14 @@ jobs:
           fi
 
           # Enable auto-merge (squash). If already enabled, this is a no-op.
-          # When auto-merge can't be enabled — no required status checks on
-          # main (GitHub rejects --auto on a "clean status" PR), or the PR
-          # was created with GITHUB_TOKEN (App creds unset), which never
-          # triggers CI so no checks will ever report — fall back to a
-          # direct squash merge. Without the fallback the PR sits open
-          # forever and the wait step below times out.
+          # This only arms when main has required status checks — with none,
+          # GitHub rejects --auto on a "clean status" PR. That's fine: the
+          # wait step below watches this PR's CI and merges when it passes
+          # (or merges directly if no CI ever reports, e.g. the composite
+          # action fell back to GITHUB_TOKEN, whose events don't trigger
+          # workflows).
           gh pr merge "$PR_NUM" --auto --squash \
-            || gh pr merge "$PR_NUM" --squash \
-            || true
+            || echo "Auto-merge not armed; the wait step merges after CI."
 
       - name: Wait for merge, auto-close on failure or stale
         env:
@@ -222,9 +229,13 @@ jobs:
 
           echo "Waiting for PR #$PR_NUM to merge..."
 
-          # Poll every 15s for up to ~10 minutes. Auto-merge will handle the
-          # PR even if this job times out — the polling is for cleanup only
-          # (auto-close on CI failure, conflicts, or main moving).
+          # Poll every 15s for up to ~10 minutes. This loop is the merge
+          # driver when auto-merge couldn't arm (no required checks on main):
+          # merge once all of this PR's checks pass, close on failure,
+          # conflict, or main moving. If no checks ever report (App creds
+          # unset → GITHUB_TOKEN events don't trigger CI), merge directly
+          # after a grace period rather than leaving the PR open forever.
+          NO_CHECKS_ROUNDS=0
           for i in $(seq 1 40); do
             sleep 15
 
@@ -248,13 +259,6 @@ jobs:
               exit 0
             fi
 
-            # If CI checks failed, close + delete the branch.
-            if gh pr checks "$PR_NUM" 2>/dev/null | grep -qi "fail"; then
-              echo "CI failed on PR #$PR_NUM. Closing + deleting branch."
-              gh pr close "$PR_NUM" --delete-branch
-              exit 0
-            fi
-
             # If PR is conflicted, close + delete the branch.
             MERGEABLE=$(gh pr view "$PR_NUM" --json mergeable --jq '.mergeable')
             if [ "$MERGEABLE" = "CONFLICTING" ]; then
@@ -262,6 +266,36 @@ jobs:
               gh pr close "$PR_NUM" --delete-branch
               exit 0
             fi
+
+            # Buckets per check: pass / fail / pending / skipping / cancel.
+            # gh exits non-zero when no checks are reported yet.
+            BUCKETS=$(gh pr checks "$PR_NUM" --json bucket --jq '[.[].bucket]' 2>/dev/null || echo '[]')
+
+            if echo "$BUCKETS" | jq -e 'any(.[]; . == "fail" or . == "cancel")' >/dev/null; then
+              echo "CI failed on PR #$PR_NUM. Closing + deleting branch."
+              gh pr close "$PR_NUM" --delete-branch
+              exit 0
+            fi
+
+            if [ "$BUCKETS" = "[]" ]; then
+              # No checks reported. Give CI a grace period to spin up, then
+              # conclude none is coming and merge unguarded.
+              NO_CHECKS_ROUNDS=$((NO_CHECKS_ROUNDS + 1))
+              if [ "$NO_CHECKS_ROUNDS" -ge 8 ]; then
+                echo "No CI checks reported after ~2 minutes. Merging without CI."
+                gh pr merge "$PR_NUM" --squash
+                exit 0
+              fi
+              continue
+            fi
+
+            if echo "$BUCKETS" | jq -e 'all(.[]; . == "pass" or . == "skipping")' >/dev/null; then
+              echo "All checks passed on PR #$PR_NUM. Merging."
+              # Auto-merge may race us to it; treat "already merged" as success.
+              gh pr merge "$PR_NUM" --squash || true
+              exit 0
+            fi
+            # Otherwise: checks still pending — keep polling.
           done
 
           echo "Timeout reached. Auto-merge will handle PR #$PR_NUM if CI passes."
