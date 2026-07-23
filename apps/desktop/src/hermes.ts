@@ -266,7 +266,9 @@ function pluginPathSuffix(caller: string, path: string): string {
  *  REST call. Broader reach (core endpoints, another namespace) is the future
  *  declared-capability seam; today the namespace IS the boundary. */
 export async function pluginRest<T>(pluginId: string, path: string, opts: PluginRestOptions = {}): Promise<T> {
-  if (!window.hermesDesktop?.api) throw new Error('Hermes desktop bridge unavailable')
+  if (!window.hermesDesktop?.api) {
+    throw new Error('Hermes desktop bridge unavailable')
+  }
 
   const suffix = pluginPathSuffix('pluginRest', path)
 
