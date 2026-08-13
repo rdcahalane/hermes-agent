@@ -2823,6 +2823,24 @@ def _save_compose_deliver(
             "(tool subprocess was killed mid-flight)."
         )
 
+    # If a mid-run steer injection derailed the model, its "final response" can
+    # be the raw STEER_MARKER scaffolding instead of real task output (observed
+    # repeatedly on feed-monitor — the longest-running skill-mode cron job —
+    # since 2026-07-01). Force the failure path so the delivered message is an
+    # honest failure summary and the run shows up as failed in cron history
+    # instead of silently looking like a clean "ok" while actually discarding
+    # the real report.
+    if d.success and final_response:
+        from agent.prompt_builder import STEER_MARKER_OPEN
+        if STEER_MARKER_OPEN in final_response:
+            d.success = False
+            d.error = (
+                "Final response leaked an internal steer-marker "
+                "(agent got derailed by a mid-run out-of-band "
+                "injection instead of completing the task). "
+                "Output discarded rather than delivered."
+            )
+
     (
         deliver_content, d.blocked_config, _silent_alert, d.incident_acked, d.failure_incident_id,
     ) = _compose_run_delivery(
