@@ -2,6 +2,7 @@
 """File Tools Module - LLM agent file manipulation tools."""
 
 import base64
+import difflib
 import errno
 import json
 import logging
@@ -2228,11 +2229,71 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
                 )
         except OSError:
             pass
+
+def _find_repo_root(path: Path) -> Path | None:
+    """Walk up from *path* looking for a ``.git`` directory. Local mirror of
+    the same simple check already duplicated in coding_context.py and
+    prompt_builder.py — kept local here to avoid a cross-module import for
+    one guard."""
+    try:
+        cur = path if path.is_dir() else path.parent
+    except Exception:
+        return None
+    for parent in [cur, *cur.parents]:
+        try:
+            if (parent / ".git").exists():
+                return parent
+        except Exception:
+            return None
+    return None
+
+
+def _large_rewrite_guard(path: str, content: str) -> str | None:
+    """Refuse a full-file overwrite that looks like wholesale content
+    regeneration rather than a targeted edit, when the target is an existing,
+    non-trivial file inside a git repo.
+
+    Added 2026-07-28 after a real incident: dispatched to port a code pattern
+    into another repo's reference-excerpts.js (a curated-content file), the
+    model used write_file_tool to regenerate the ENTIRE file from its own
+    training-data pattern-matching instead of making a targeted addition —
+    silently destroying real, tailored analytical content and replacing it
+    with fabricated, unsourced boilerplate, while still reporting success.
+    This can't rely on the model reliably following a soft prompt instruction
+    (it already didn't, despite an existing anti-fabrication system_prompt
+    clause) — it needs a hard check at the one function every content write
+    funnels through.
+    """
+    try:
+        p = Path(path).expanduser()
+        if not p.exists() or not p.is_file():
+            return None  # new file — nothing to preserve, not this guard's job
+        old = p.read_text(errors="ignore")
+        if len(old) < 500:
+            return None  # tiny files aren't worth gating
+        if _find_repo_root(p) is None:
+            return None  # only guard git-tracked work — scope the blast radius
+        ratio = difflib.SequenceMatcher(None, old, content).ratio()
+        if ratio < 0.5:
+            return (
+                f"Refusing write_file to {path}: new content shares only "
+                f"{ratio:.0%} similarity with the existing file (git-tracked, "
+                f"{len(old)} bytes). This looks like a full-file regeneration, "
+                "not a targeted edit — the most common way real content gets "
+                "silently destroyed and replaced with fabricated text. Use "
+                "patch_tool for targeted changes that preserve the rest of the "
+                "file. If a full rewrite is genuinely intended (e.g. after "
+                "reading and deliberately restructuring the whole file), retry "
+                "write_file with ack_large_rewrite=true."
+            )
+    except Exception:
+        return None  # never let this guard itself break a legitimate write
     return None
 
 
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
+                    ack_large_rewrite: bool = False,
                     session_id: str | None = None) -> str:
     """Write content to a file.
 
@@ -2241,6 +2302,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     skills/plugins/cron/memories directory; everything else is unaffected.
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
+
+    ``ack_large_rewrite`` opts out of the large-rewrite content-preservation
+    guard (see ``_large_rewrite_guard``) — pass ``True`` only when a full
+    rewrite of an existing git-tracked file is genuinely intended.
     """
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
@@ -2258,6 +2323,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
             return tool_error(cross_warning)
+    if not ack_large_rewrite:
+        rewrite_err = _large_rewrite_guard(path, content)
+        if rewrite_err:
+            return tool_error(rewrite_err)
     if _is_internal_file_tool_content(content):
         return tool_error(
             "Refusing to write internal read_file display text as file content. "
@@ -2677,7 +2746,7 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed.",
+    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits, and ALWAYS prefer 'patch' when adding to or modifying an existing file rather than regenerating its content from memory. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed. For an existing, non-trivial (500+ byte) file inside a git repo, this call is REFUSED if the new content shares less than 50% similarity with the current content — this catches accidental full-file regeneration that silently destroys real content, which has actually happened. If you deliberately intend a full rewrite of such a file, pass ack_large_rewrite=true; otherwise switch to 'patch'.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -2686,6 +2755,11 @@ WRITE_FILE_SCHEMA = {
             "cross_profile": {
                 "type": "boolean",
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
+                "default": False,
+            },
+            "ack_large_rewrite": {
+                "type": "boolean",
+                "description": "Opt out of the large-rewrite content-preservation guard. Defaults to false. Set true ONLY when you have actually read the existing file and deliberately intend to replace most of its content — not as a default way past the guard. If you're unsure why this guard fired, use 'patch' instead.",
                 "default": False,
             },
         },
@@ -2792,6 +2866,7 @@ def _handle_write_file(args, **kw):
     return write_file_tool(
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
+        ack_large_rewrite=bool(args.get("ack_large_rewrite", False)),
         session_id=kw.get("session_id"),
     )
 
