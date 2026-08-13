@@ -7,6 +7,7 @@ staleness state).
 """
 
 import base64
+import difflib
 import errno
 import json
 import logging
@@ -824,23 +825,88 @@ def _whole_file_rewrite_hint(task_id: str, resolved: str | None, new_content: st
         f"line(s) actually changed. Re-sending a {len(new_content):,}-char file costs output tokens for every "
         "unchanged line; for edits like this use patch (old_string/new_string), which sends only the changed region."
     )
+def _find_repo_root(path: Path) -> Path | None:
+    """Walk up from *path* looking for a ``.git`` directory. Local mirror of
+    the same simple check already duplicated in coding_context.py and
+    prompt_builder.py — kept local here to avoid a cross-module import for
+    one guard."""
+    try:
+        cur = path if path.is_dir() else path.parent
+    except Exception:
+        return None
+    for parent in [cur, *cur.parents]:
+        try:
+            if (parent / ".git").exists():
+                return parent
+        except Exception:
+            return None
+    return None
+
+
+def _large_rewrite_guard(path: str, content: str) -> str | None:
+    """Refuse a full-file overwrite that looks like wholesale content
+    regeneration rather than a targeted edit, when the target is an existing,
+    non-trivial file inside a git repo.
+
+    Added 2026-07-28 after a real incident: dispatched to port a code pattern
+    into another repo's reference-excerpts.js (a curated-content file), the
+    model used write_file_tool to regenerate the ENTIRE file from its own
+    training-data pattern-matching instead of making a targeted addition —
+    silently destroying real, tailored analytical content and replacing it
+    with fabricated, unsourced boilerplate, while still reporting success.
+    This can't rely on the model reliably following a soft prompt instruction
+    (it already didn't, despite an existing anti-fabrication system_prompt
+    clause) — it needs a hard check at the one function every content write
+    funnels through.
+    """
+    try:
+        p = Path(path).expanduser()
+        if not p.exists() or not p.is_file():
+            return None  # new file — nothing to preserve, not this guard's job
+        old = p.read_text(errors="ignore")
+        if len(old) < 500:
+            return None  # tiny files aren't worth gating
+        if _find_repo_root(p) is None:
+            return None  # only guard git-tracked work — scope the blast radius
+        ratio = difflib.SequenceMatcher(None, old, content).ratio()
+        if ratio < 0.5:
+            return (
+                f"Refusing write_file to {path}: new content shares only "
+                f"{ratio:.0%} similarity with the existing file (git-tracked, "
+                f"{len(old)} bytes). This looks like a full-file regeneration, "
+                "not a targeted edit — the most common way real content gets "
+                "silently destroyed and replaced with fabricated text. Use "
+                "patch_tool for targeted changes that preserve the rest of the "
+                "file. If a full rewrite is genuinely intended (e.g. after "
+                "reading and deliberately restructuring the whole file), retry "
+                "write_file with ack_large_rewrite=true."
+            )
+    except Exception:
+        return None  # never let this guard itself break a legitimate write
+    return None
 
 
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
+                    ack_large_rewrite: bool = False,
                     session_id: str | None = None) -> str:
     """Write content to a file.
 
     ``cross_profile`` bypasses the sandbox-mirror lost-write guards only
     (unadvertised in the schema; the mirror rejection error teaches it — the
     cross-PROFILE guard it was named for no longer exists).
+
+    ``ack_large_rewrite`` opts out of the large-rewrite content-preservation
+    guard (see ``_large_rewrite_guard``) — pass ``True`` only when a full
+    rewrite of an existing git-tracked file is genuinely intended.
     """
     # write_file checks the binary-document guard before the mirror guard.
     err = (_check_sensitive_path(path, task_id)
            or _check_binary_document_write(path, task_id)
            or _check_protected_instruction_write([path], task_id)
            or _check_approval_required_write([path], task_id)
-           or (None if cross_profile else _check_cross_profile_path(path, task_id)))
+           or (None if cross_profile else _check_cross_profile_path(path, task_id))
+           or (None if ack_large_rewrite else _large_rewrite_guard(path, content)))
     if not err and _is_internal_file_tool_content(content):
         err = ("Refusing to write internal read_file display text as file content. "
                "Strip read_file line-number prefixes or reconstruct the intended "
@@ -1128,7 +1194,7 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. For an EXISTING file, call read_file first: write_file refuses (file untouched) when this task has no current full read/write of the file or the file changed on disk since; on refusal, read_file, merge, then retry. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed.",
+    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits, and ALWAYS prefer 'patch' when adding to or modifying an existing file rather than regenerating its content from memory. For an EXISTING file, call read_file first: write_file refuses (file untouched) when this task has no current full read/write of the file or the file changed on disk since; on refusal, read_file, merge, then retry. Separately, for an existing, non-trivial (500+ byte) file inside a git repo, this call is REFUSED if the new content shares less than 50% similarity with the current content — this catches accidental full-file regeneration that silently destroys real content, which has actually happened. If you deliberately intend a full rewrite of such a file, pass ack_large_rewrite=true; otherwise switch to 'patch'. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1139,6 +1205,11 @@ WRITE_FILE_SCHEMA = {
             # rejection error teaches it. Unadvertised: the cross-PROFILE
             # guard it was named for was removed (profiles are not isolated,
             # maintainer decision), and mirror hits are rare + self-teaching.
+            "ack_large_rewrite": {
+                "type": "boolean",
+                "description": "Opt out of the large-rewrite content-preservation guard. Defaults to false. Set true ONLY when you have actually read the existing file and deliberately intend to replace most of its content — not as a default way past the guard. If you're unsure why this guard fired, use 'patch' instead.",
+                "default": False,
+            },
         },
         "required": ["path", "content"]
     }
@@ -1290,6 +1361,7 @@ def _handle_write_file(args, **kw):
     return write_file_tool(
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
+        ack_large_rewrite=bool(args.get("ack_large_rewrite", False)),
         session_id=kw.get("session_id"),
     )
 
